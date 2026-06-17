@@ -1,0 +1,23 @@
+target/
+node_modules/
+.soroban/
+*.wasm
+!contracts/zk-verifier/ultrahonk_verifier.wasm
+.env
+.env.local
+app/.next/
+circuits/*/target/
+circuits/*/proofs/
+crs/
+
+# OS files
+.DS_Store
+**/.DS_Store
+
+# Logs
+*.log
+
+# Local temporary tool/cache artifacts
+.tmp*
+**/.tmp*
+*.tmp
