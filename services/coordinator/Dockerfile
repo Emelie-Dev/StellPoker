@@ -6,6 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY contracts/ ./contracts/
 COPY stellar-zk-cards/ ./stellar-zk-cards/
 COPY services/ ./services/
+COPY vendor/ ./vendor/
 RUN cargo build --release -p coordinator
 
 # Build co-noir from source
