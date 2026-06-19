@@ -17,6 +17,7 @@ use types::*;
 /// TTL for table storage (30 days in ledgers, ~5 seconds per ledger)
 const TABLE_TTL_THRESHOLD: u32 = 17_280; // ~1 day — trigger extension when below this
 const TABLE_TTL_EXTEND: u32 = 518_400; // ~30 days
+const BOARD_INDICES_COUNT: u32 = 5; // flop(3) + turn(1) + river(1)
 
 #[contract]
 pub struct PokerTableContract;
@@ -45,6 +46,55 @@ fn save_table(env: &Env, table: &TableState) {
     env.storage()
         .instance()
         .extend_ttl(TABLE_TTL_THRESHOLD, TABLE_TTL_EXTEND);
+}
+
+/// Extract a u32 from a BN254 field element at `field_index` in public_inputs.
+/// Small integers are encoded big-endian in the last 4 bytes.
+fn extract_u32_from_public_inputs(public_inputs: &Bytes, field_index: u32) -> u32 {
+    let start = field_index * 32 + 28;
+    let b0 = public_inputs.get(start).unwrap_or(0);
+    let b1 = public_inputs.get(start + 1).unwrap_or(0);
+    let b2 = public_inputs.get(start + 2).unwrap_or(0);
+    let b3 = public_inputs.get(start + 3).unwrap_or(0);
+    (b0 as u32) << 24 | (b1 as u32) << 16 | (b2 as u32) << 8 | b3 as u32
+}
+
+/// Verify that the committee-submitted hole_cards (in active-player order, seat
+/// order skipping folded) match the card values in the proof's public outputs.
+///
+/// Public output layout for showdown:
+///   [13..19)  hole_card1[0..6] — seat-indexed
+///   [19..25)  hole_card2[0..6] — seat-indexed
+fn verify_hole_cards_against_proof(
+    _env: &Env,
+    table: &TableState,
+    public_inputs: &Bytes,
+    hole_cards: &Vec<(u32, u32)>,
+) -> Result<(), PokerTableError> {
+    let mut active_idx: u32 = 0;
+    for i in 0..table.players.len() {
+        let player = table
+            .players
+            .get(i)
+            .ok_or(PokerTableError::InvalidPlayerIndex)?;
+        if player.folded {
+            continue;
+        }
+        let seat = player.seat_index;
+        let proof_c1 = extract_u32_from_public_inputs(public_inputs, 13 + seat);
+        let proof_c2 = extract_u32_from_public_inputs(public_inputs, 19 + seat);
+        let (submitted_c1, submitted_c2) = hole_cards
+            .get(active_idx)
+            .ok_or(PokerTableError::InvalidHoleCards)?;
+        if proof_c1 != submitted_c1 || proof_c2 != submitted_c2 {
+            return Err(PokerTableError::HoleCardMismatch);
+        }
+        active_idx += 1;
+    }
+    if active_idx == 0 {
+        return Err(PokerTableError::InvalidHoleCards);
+    }
+    Ok(())
 }
 
 fn derive_session_id(table_id: u32, hand_number: u32) -> u32 {
@@ -419,21 +469,49 @@ impl PokerTableContract {
             return Err(PokerTableError::NotAuthorizedCommittee);
         }
 
+        // Extract board_indices from dealt_indices (last 5 elements after all reveals).
+        if table.dealt_indices.len() < BOARD_INDICES_COUNT {
+            return Err(PokerTableError::BoardNotComplete);
+        }
+        let board_start = table.dealt_indices.len() - BOARD_INDICES_COUNT;
+        let mut board_indices: Vec<u32> = Vec::new(&env);
+        for i in board_start..table.dealt_indices.len() {
+            board_indices
+                .push_back(table.dealt_indices.get(i).ok_or(PokerTableError::BoardNotComplete)?);
+        }
+
         // Verify showdown proof via zk-verifier.
+        // The verifier now validates that hand_commitments, board_indices, and
+        // deck_root in the public_inputs match the on-chain state.
         let verifier_client = verifier::ZkVerifierClient::new(&env, &table.config.verifier);
-        // winner_index = 0 placeholder; the proof itself encodes the winner.
         if !verifier_client.verify_showdown(
             &proof,
             &public_inputs,
             &table.hand_commitments,
-            &table.board_cards,
-            &0u32,
+            &board_indices,
+            &table.deck_root,
         ) {
             return Err(PokerTableError::ShowdownProofVerificationFailed);
         }
 
-        // Evaluate hands and determine winner.
-        game::settle_showdown(&env, &mut table, &hole_cards)?;
+        // Extract the winner_index from the proof's public outputs (field 25).
+        // The circuit proved this winner; we use it for payout instead of
+        // re-evaluating hands on-chain.
+        let winner_index = extract_u32_from_public_inputs(&public_inputs, 25);
+
+        // Verify that the committee-submitted hole_cards match the proof outputs.
+        // Hole cards from the proof are seat-indexed (field 13..19 for hole_card1,
+        // field 19..25 for hole_card2).  Submitted hole_cards are in active-player
+        // order (seat order, skipping folded).
+        verify_hole_cards_against_proof(
+            &env,
+            &table,
+            &public_inputs,
+            &hole_cards,
+        )?;
+
+        // Settle using the winner_index from the proof (not re-evaluating).
+        game::settle_showdown(&env, &mut table, winner_index)?;
 
         save_table(&env, &table);
         Ok(())

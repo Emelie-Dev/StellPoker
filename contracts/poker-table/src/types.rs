@@ -52,6 +52,7 @@ pub enum PokerTableError {
     InvalidHoleCards = 31,
     TimeoutNotReached = 32,
     TimeoutNotApplicable = 33,
+    HoleCardMismatch = 34,
 }
 
 #[contracttype]

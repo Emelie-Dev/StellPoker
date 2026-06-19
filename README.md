@@ -54,8 +54,8 @@ Supports up to 6 players. Includes a solo mode against a deterministic AI oppone
 ## Contracts on Testnet
 
 | Contract | Address |
-|---|---|
-| Poker Table | [CB7M3V3POQJR66425J3ILLHS3T4EUBRY67R7AVKSM255WBWOZG7XCYGL](https://stellar.expert/explorer/testnet/contract/CB7M3V3POQJR66425J3ILLHS3T4EUBRY67R7AVKSM255WBWOZG7XCYGL) |
+|---|---|---|
+| Poker Table | [CA3RAB66WJ3OONO4OFYEATISRZA3ND65MN3DET5IE2XXSZZMPKH3CHAV](https://stellar.expert/explorer/testnet/contract/CA3RAB66WJ3OONO4OFYEATISRZA3ND65MN3DET5IE2XXSZZMPKH3CHAV) |
 | Committee Registry | [GBTYELEQ2YZH2W6SXLHT4AX6TYBHHU7LNNPKJV7J37VS3S5GPA75KRDU](https://stellar.expert/explorer/testnet/account/GBTYELEQ2YZH2W6SXLHT4AX6TYBHHU7LNNPKJV7J37VS3S5GPA75KRDU) |
 
 Works alongside the Stellar Game Studio deployed at [CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG](https://stellar.expert/explorer/testnet/contract/CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG).

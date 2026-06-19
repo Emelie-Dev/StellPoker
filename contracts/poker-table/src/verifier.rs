@@ -35,8 +35,8 @@ pub trait ZkVerifier {
         proof: Bytes,
         public_inputs: Bytes,
         hand_commitments: Vec<BytesN<32>>,
-        board_cards: Vec<u32>,
-        winner_index: u32,
+        board_indices: Vec<u32>,
+        deck_root: BytesN<32>,
     ) -> Result<bool, soroban_sdk::Error>;
 }
 
@@ -72,8 +72,8 @@ impl ZkVerifierContract {
         _proof: Bytes,
         _public_inputs: Bytes,
         _hand_commitments: Vec<BytesN<32>>,
-        _board_cards: Vec<u32>,
-        _winner_index: u32,
+        _board_indices: Vec<u32>,
+        _deck_root: BytesN<32>,
     ) -> Result<bool, soroban_sdk::Error> {
         Ok(true)
     }

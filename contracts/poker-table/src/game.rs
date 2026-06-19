@@ -92,62 +92,18 @@ pub fn last_player_standing(table: &TableState) -> Option<u32> {
     None
 }
 
-/// Settle the showdown: evaluate hands and distribute pot.
+/// Settle the showdown using the winner_index proved by the ZK circuit.
+///
+/// The winner_index is a 0-based seat index determined by the showdown_valid
+/// circuit, which evaluates all active hands against the secret deck and
+/// commitments.  The committee-submitted hole_cards have already been verified
+/// against the proof outputs by the caller.
 pub fn settle_showdown(
     env: &Env,
     table: &mut TableState,
-    hole_cards: &Vec<(u32, u32)>,
+    winner_seat: u32,
 ) -> Result<(), PokerTableError> {
-    // Collect active players' hands
-    let mut best_rank: u32 = 0;
-    let mut winner_seat: u32 = 0;
-
-    let board = &table.board_cards;
-    if board.len() != 5 {
-        return Err(PokerTableError::BoardNotComplete);
-    }
-
-    let board_arr: [u32; 5] = [
-        board.get(0).ok_or(PokerTableError::BoardNotComplete)?,
-        board.get(1).ok_or(PokerTableError::BoardNotComplete)?,
-        board.get(2).ok_or(PokerTableError::BoardNotComplete)?,
-        board.get(3).ok_or(PokerTableError::BoardNotComplete)?,
-        board.get(4).ok_or(PokerTableError::BoardNotComplete)?,
-    ];
-
-    let mut active_idx = 0u32;
-    for i in 0..table.players.len() {
-        let p = table
-            .players
-            .get(i)
-            .ok_or(PokerTableError::InvalidPlayerIndex)?;
-        if p.folded {
-            continue;
-        }
-
-        let (c1, c2) = hole_cards
-            .get(active_idx)
-            .ok_or(PokerTableError::InvalidHoleCards)?;
-        let cards: [u32; 7] = [
-            c1,
-            c2,
-            board_arr[0],
-            board_arr[1],
-            board_arr[2],
-            board_arr[3],
-            board_arr[4],
-        ];
-
-        let rank = stellar_zk_cards::evaluate_hand(&cards);
-        if rank.score > best_rank {
-            best_rank = rank.score;
-            winner_seat = p.seat_index;
-        }
-
-        active_idx += 1;
-    }
-
-    // Award pot to winner
+    // Award pot to the proved winner.
     let winnings = table.pot;
     let mut winner = table
         .players
