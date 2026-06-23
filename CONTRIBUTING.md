@@ -64,11 +64,36 @@ docker-compose up
 
 Each service (`soroban`, `mpc-node-0/1/2`, `coordinator`) defines a `healthcheck`,
 and the `coordinator` only starts once Soroban and all three MPC nodes report
-healthy. Check status with:
+healthy (`depends_on: condition: service_healthy`). Each node also has a
+`start_period` grace window (60s for MPC nodes to cover co-noir key generation
+and CRS load, 30s for Soroban) during which a failing check does **not** count
+against the retry budget. Check status with:
 
 ```bash
 docker-compose ps
 ```
+
+### Diagnosing unhealthy services
+
+`docker-compose ps` shows a `STATUS` of `healthy`, `health: starting`, or
+`unhealthy` for each service. To investigate one that won't go healthy:
+
+```bash
+# See the most recent health-check probes (exit code + captured output).
+docker inspect --format '{{json .State.Health}}' stellpoker-mpc-node-0-1 | jq
+
+# Watch health transitions live across the whole stack.
+docker events --filter event=health_status
+
+# Tail a service's own logs for the underlying error (panic, bind conflict, …).
+docker-compose logs -f mpc-node-0
+```
+
+Each health check is wrapped so that a failed probe writes a
+`WARN: <service> health check failed` line to the health log (visible in the
+`docker inspect` output above), making failures easy to grep. If a service is
+stuck in `health: starting` past its `start_period`, the underlying process is
+almost certainly still initializing or crash-looping — check its logs.
 
 If you're running services directly instead of via docker-compose, use
 `./scripts/start-local.sh` — it polls each node's `/health` endpoint (and the
