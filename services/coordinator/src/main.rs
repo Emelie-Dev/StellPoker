@@ -14,6 +14,7 @@
 //!   Barretenberg/UltraHonk proofs
 
 use axum::{
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -23,7 +24,9 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
 mod api;
+mod middleware as request_log;
 mod mpc;
+mod session_gc;
 mod soroban;
 
 #[derive(Clone)]
@@ -34,6 +37,7 @@ struct AppState {
     soroban_config: soroban::SorobanConfig,
     auth_state: Arc<RwLock<AuthState>>,
     rate_limit_state: Arc<RwLock<RateLimitState>>,
+    mpc_sessions: session_gc::SessionStore,
 }
 
 #[derive(Clone)]
@@ -99,7 +103,13 @@ struct RateLimitState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Structured logging: REQUEST_LOG_FORMAT=json uses JSON output; default is human-readable.
+    let log_format = std::env::var("REQUEST_LOG_FORMAT").unwrap_or_default();
+    if log_format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt().json().init();
+    } else {
+        tracing_subscriber::fmt().init();
+    }
 
     let mpc_config = MpcConfig {
         node_endpoints: vec![
@@ -124,6 +134,12 @@ async fn main() {
         tracing::warn!("Soroban not configured — on-chain submission disabled");
     }
 
+    let mpc_sessions: session_gc::SessionStore =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    // Start background GC task for timed-out MPC sessions.
+    session_gc::spawn_gc_task(Arc::clone(&mpc_sessions));
+
     let state = AppState {
         tables: Arc::new(RwLock::new(HashMap::new())),
         lobby_assignments: Arc::new(RwLock::new(HashMap::new())),
@@ -131,6 +147,7 @@ async fn main() {
         soroban_config,
         auth_state: Arc::new(RwLock::new(AuthState::default())),
         rate_limit_state: Arc::new(RwLock::new(RateLimitState::default())),
+        mpc_sessions,
     };
 
     let app = Router::new()
@@ -159,6 +176,11 @@ async fn main() {
         )
         .route("/api/table/:table_id/state", get(api::get_table_state))
         .route("/api/committee/status", get(api::committee_status))
+        // Admin: manual session cancellation (issue #49)
+        .route("/api/session/:session_id/cancel", post(api::cancel_mpc_session))
+        // Admin: session status (issue #49)
+        .route("/api/session/:session_id/status", get(api::get_mpc_session_status))
+        .layer(middleware::from_fn(request_log::log_request))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
