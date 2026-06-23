@@ -26,9 +26,9 @@ use parsing::{
     parse_deal_outputs, parse_requested_buy_in, parse_reveal_outputs, parse_showdown_outputs,
 };
 use session::{
-    ensure_session_exists, fetch_onchain_table_view, is_identity_missing_error,
-    next_proof_session_id, resolve_deal_players_from_lobby, select_mpc_nodes, validate_players,
-    validate_reveal_phase, validate_table_id,
+    dynamic_discovery_active, ensure_session_exists, fetch_onchain_table_view,
+    is_identity_missing_error, next_proof_session_id, resolve_deal_players_from_lobby,
+    select_mpc_nodes, validate_players, validate_reveal_phase, validate_table_id,
 };
 
 const MAX_PLAYERS: usize = 6;
@@ -1032,6 +1032,84 @@ pub async fn committee_status(State(state): State<AppState>) -> Json<CommitteeSt
         healthy,
         status: "active".to_string(),
     })
+}
+
+/// POST /api/node/register
+///
+/// Self-registration (and implicit heartbeat) for an MPC node. Only available
+/// when dynamic discovery is active (no committee registry and no static
+/// `MPC_NODE_*` endpoints); otherwise returns `409 Conflict`.
+pub async fn register_node(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterNodeRequest>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let id = req.id.trim();
+    let endpoint = req.endpoint.trim();
+    if id.is_empty() || !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut registry = state.node_registry.write().await;
+    let created = registry.register(id.to_string(), endpoint.to_string());
+    tracing::info!(
+        "MPC node '{}' {} ({})",
+        id,
+        if created { "registered" } else { "refreshed" },
+        endpoint
+    );
+    Ok(Json(NodeRegistryResponse {
+        id: id.to_string(),
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
+}
+
+/// POST /api/node/{id}/heartbeat
+///
+/// Keep an existing registration alive. Returns `404` if the node is unknown
+/// (the node should re-register), or `409` when dynamic discovery is inactive.
+pub async fn node_heartbeat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let mut registry = state.node_registry.write().await;
+    if !registry.heartbeat(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(NodeRegistryResponse {
+        id,
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
+}
+
+/// DELETE /api/node/{id}
+///
+/// Graceful deregistration (e.g. on node shutdown). Returns `404` if unknown,
+/// or `409` when dynamic discovery is inactive.
+pub async fn deregister_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let mut registry = state.node_registry.write().await;
+    if !registry.deregister(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    tracing::info!("MPC node '{}' deregistered", id);
+    Ok(Json(NodeRegistryResponse {
+        id,
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
 }
 
 /// POST /api/session/:session_id/cancel

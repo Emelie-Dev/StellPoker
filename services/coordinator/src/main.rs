@@ -21,7 +21,7 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
@@ -41,6 +41,7 @@ mod api;
 mod audit_log;
 mod cors_db;
 mod db;
+mod discovery;
 mod feature_flags;
 mod hot_reload;
 mod mpc;
@@ -127,6 +128,10 @@ struct AppState {
     db_pool: Option<Arc<sqlx::PgPool>>,
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
+    /// Registry of dynamically discovered MPC nodes. Consulted by
+    /// `select_mpc_nodes` only when neither the on-chain committee registry nor
+    /// static `MPC_NODE_*` endpoints are configured (see [`discovery`]).
+    node_registry: Arc<RwLock<discovery::NodeRegistry>>,
 }
 
 #[derive(Clone)]
@@ -134,6 +139,10 @@ struct AppState {
 struct MpcConfig {
     /// Endpoints of the 3 MPC nodes
     node_endpoints: Vec<String>,
+    /// Whether `node_endpoints` came from explicitly-set `MPC_NODE_*` env vars
+    /// (vs. built-in localhost defaults). When true, dynamic node discovery is
+    /// disabled and these static endpoints are used (backward compatibility).
+    static_endpoints_configured: bool,
     /// Path to compiled Noir circuits (ACIR)
     circuit_dir: String,
     /// Soroban RPC endpoint
@@ -202,12 +211,17 @@ async fn main() {
         tracing_subscriber::fmt().init();
     }
 
+    // If any MPC_NODE_* env var is explicitly set, treat the endpoints as
+    // statically configured and disable dynamic discovery (backward compat).
+    let static_endpoints_configured = (0..3)
+        .any(|i| std::env::var(format!("MPC_NODE_{}", i)).is_ok());
     let mpc_config = MpcConfig {
         node_endpoints: vec![
             std::env::var("MPC_NODE_0").unwrap_or_else(|_| "http://localhost:8101".to_string()),
             std::env::var("MPC_NODE_1").unwrap_or_else(|_| "http://localhost:8102".to_string()),
             std::env::var("MPC_NODE_2").unwrap_or_else(|_| "http://localhost:8103".to_string()),
         ],
+        static_endpoints_configured,
         circuit_dir: std::env::var("CIRCUIT_DIR").unwrap_or_else(|_| "./circuits".to_string()),
         soroban_rpc: std::env::var("SOROBAN_RPC")
             .unwrap_or_else(|_| "http://localhost:8000/soroban/rpc".to_string()),
@@ -444,6 +458,7 @@ async fn main() {
         db_pool,
         instance_id,
         plugin_loader,
+        node_registry: Arc::new(RwLock::new(discovery::NodeRegistry::new())),
     };
 
     if let Some(path) = hot_reload_snapshot {
@@ -511,6 +526,11 @@ async fn main() {
         .route("/metrics", get(metrics_endpoint))
         .route("/api/health", get(health))
         .route("/api/stats", get(get_stats))
+        // Dynamic MPC node discovery (active only when neither the committee
+        // registry nor static MPC_NODE_* endpoints are configured).
+        .route("/api/node/register", post(api::register_node))
+        .route("/api/node/:id/heartbeat", post(api::node_heartbeat))
+        .route("/api/node/:id", delete(api::deregister_node))
         .route("/api/flags", get(api::flags::list_flags))
         .route("/api/flags/:key", post(api::flags::set_flag))
         // Plugin management endpoints
