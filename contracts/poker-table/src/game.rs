@@ -108,14 +108,17 @@ pub fn settle_showdown(
 ) -> Result<(), PokerTableError> {
     let total_pot = table.pot;
 
-    // Compute the main pot and any side pots from cumulative contributions, then
-    // award each to its best eligible contributor. The proved winner is ranked
-    // first; the remaining non-folded contenders follow in seat order so that
-    // side pots the proved winner cannot win still go to an eligible player.
+    // Compute the main pot and any side pots from cumulative contributions,
+    // then deduct rake from each pot independently before awarding it to its
+    // best eligible contributor. The proved winner is ranked first; the
+    // remaining non-folded contenders follow in seat order so that side pots
+    // the proved winner cannot win still go to an eligible player.
     let pots = pot::calculate_side_pots(env, table)?;
-    table.side_pots = pots.clone();
+    let (net_pots, rake) = pot::apply_rake(env, &pots, table.config.rake_bps)?;
+    table.side_pots = net_pots.clone();
+    table.rake_balance += rake;
     let ranking = build_winner_ranking(env, table, winner_seat)?;
-    let payouts = pot::distribute_pots(env, table, &pots, &ranking)?;
+    let payouts = pot::distribute_pots(env, table, &net_pots, &ranking)?;
 
     table.pot = 0;
     table.phase = GamePhase::Settlement;
@@ -133,6 +136,12 @@ pub fn settle_showdown(
         (Symbol::new(env, "hand_settled"), table.id),
         (winner.address.clone(), total_pot, payouts),
     );
+    if rake > 0 {
+        env.events().publish(
+            (Symbol::new(env, "rake_collected"), table.id),
+            (table.hand_number, rake, table.rake_balance),
+        );
+    }
     Ok(())
 }
 
@@ -165,7 +174,9 @@ fn build_winner_ranking(
 /// Award pot to last player standing (all others folded).
 pub fn settle_fold_win(env: &Env, table: &mut TableState) -> Result<(), PokerTableError> {
     if let Some(winner_seat) = last_player_standing(table) {
-        let winnings = table.pot;
+        let total_pot = table.pot;
+        let rake = (total_pot * table.config.rake_bps as i128) / 10_000;
+        let winnings = total_pot - rake;
         let mut winner = table
             .players
             .get(winner_seat)
@@ -173,6 +184,7 @@ pub fn settle_fold_win(env: &Env, table: &mut TableState) -> Result<(), PokerTab
         winner.stack += winnings;
         table.players.set(winner_seat, winner.clone());
         table.pot = 0;
+        table.rake_balance += rake;
         table.phase = GamePhase::Settlement;
         table.last_action_ledger = env.ledger().sequence();
 
@@ -184,6 +196,12 @@ pub fn settle_fold_win(env: &Env, table: &mut TableState) -> Result<(), PokerTab
             (Symbol::new(env, "fold_win"), table.id),
             (winner.address.clone(), winnings),
         );
+        if rake > 0 {
+            env.events().publish(
+                (Symbol::new(env, "rake_collected"), table.id),
+                (table.hand_number, rake, table.rake_balance),
+            );
+        }
     }
     Ok(())
 }

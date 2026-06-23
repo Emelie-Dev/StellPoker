@@ -69,6 +69,7 @@ mod test {
             committee: committee.clone(),
             verifier: verifier.clone(),
             game_hub,
+            rake_bps: 0,
         }
     }
 
@@ -112,6 +113,31 @@ mod test {
     fn create_default_table(s: &TestSetup) -> u32 {
         let config = default_config(&s.env, &s.token.address, &s.committee, &s.verifier);
         s.client.create_table(&s.admin, &config)
+    }
+
+    /// Build a table config with larger blinds and a configurable rake, used
+    /// by the rake tests below to make the fee clearly visible.
+    fn rake_config(
+        env: &Env,
+        token: &Address,
+        committee: &Address,
+        verifier: &Address,
+        rake_bps: u32,
+    ) -> TableConfig {
+        let game_hub = env.register(GameHubContract, ());
+        TableConfig {
+            token: token.clone(),
+            min_buy_in: 100,
+            max_buy_in: 100_000,
+            small_blind: 100,
+            big_blind: 200,
+            max_players: 6,
+            timeout_ledgers: 100,
+            committee: committee.clone(),
+            verifier: verifier.clone(),
+            game_hub,
+            rake_bps,
+        }
     }
 
     /// Mint tokens, join the table, and return the assigned seat index.
@@ -798,5 +824,157 @@ mod test {
             assert!(!p.folded);
             assert!(!p.all_in);
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 6. Rake / fee mechanism (issue #31)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #36)")]
+    fn test_create_table_rejects_rake_above_max() {
+        let s = setup();
+        let config = rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 501);
+        s.client.create_table(&s.admin, &config);
+    }
+
+    #[test]
+    fn test_create_table_accepts_max_rake() {
+        let s = setup();
+        let config = rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 500);
+        let table_id = s.client.create_table(&s.admin, &config);
+        let table = s.client.get_table(&table_id);
+        assert_eq!(table.config.rake_bps, 500);
+        assert_eq!(table.rake_balance, 0);
+    }
+
+    #[test]
+    fn test_fold_win_deducts_rake() {
+        let s = setup();
+        let config = rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 500); // 5%
+        let table_id = s.client.create_table(&s.admin, &config);
+
+        let p1 = Address::generate(&s.env);
+        let p2 = Address::generate(&s.env);
+        join_player(&s, table_id, &p1, 5000);
+        join_player(&s, table_id, &p2, 5000);
+
+        s.client.start_hand(&table_id);
+        commit_mock_deal(&s, table_id, 2);
+
+        let table = s.client.get_table(&table_id);
+        let pot = table.pot; // small_blind 100 + big_blind 200 = 300
+        assert_eq!(pot, 300);
+
+        let current = table.current_turn;
+        let folder = table.players.get(current).unwrap();
+        let other_seat = if current == 0 { 1u32 } else { 0u32 };
+        let winner_stack_before = table.players.get(other_seat).unwrap().stack;
+
+        s.client
+            .player_action(&table_id, &folder.address, &Action::Fold);
+
+        let table = s.client.get_table(&table_id);
+        // 5% of 300 = 15 rake; winner receives the remaining 285.
+        let expected_rake = 15;
+        assert_eq!(table.rake_balance, expected_rake);
+        let winner_after = table.players.get(other_seat).unwrap();
+        assert_eq!(
+            winner_after.stack,
+            winner_stack_before + pot - expected_rake
+        );
+        assert_eq!(s.client.get_rake_balance(&table_id), expected_rake);
+    }
+
+    #[test]
+    fn test_fold_win_rake_rounds_down_on_small_pot() {
+        // Smallest possible non-zero pot (blinds 1 + 2) where rake floors to
+        // zero — the whole pot goes to the winner and no chips are burned.
+        let s = setup();
+        let config = TableConfig {
+            small_blind: 1,
+            big_blind: 2,
+            ..rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 100) // 1%
+        };
+        let table_id = s.client.create_table(&s.admin, &config);
+
+        let p1 = Address::generate(&s.env);
+        let p2 = Address::generate(&s.env);
+        join_player(&s, table_id, &p1, 5000);
+        join_player(&s, table_id, &p2, 5000);
+
+        s.client.start_hand(&table_id);
+        commit_mock_deal(&s, table_id, 2);
+
+        let table = s.client.get_table(&table_id);
+        assert_eq!(table.pot, 3); // 1 + 2
+
+        let current = table.current_turn;
+        let folder = table.players.get(current).unwrap();
+        let other_seat = if current == 0 { 1u32 } else { 0u32 };
+        let winner_stack_before = table.players.get(other_seat).unwrap().stack;
+
+        s.client
+            .player_action(&table_id, &folder.address, &Action::Fold);
+
+        let table = s.client.get_table(&table_id);
+        // floor(3 * 100 / 10_000) = 0 -> no rake taken, full pot to winner.
+        assert_eq!(table.rake_balance, 0);
+        let winner_after = table.players.get(other_seat).unwrap();
+        assert_eq!(winner_after.stack, winner_stack_before + 3);
+    }
+
+    #[test]
+    fn test_withdraw_rake_transfers_to_admin() {
+        let s = setup();
+        let config = rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 500);
+        let table_id = s.client.create_table(&s.admin, &config);
+
+        let p1 = Address::generate(&s.env);
+        let p2 = Address::generate(&s.env);
+        join_player(&s, table_id, &p1, 5000);
+        join_player(&s, table_id, &p2, 5000);
+
+        s.client.start_hand(&table_id);
+        commit_mock_deal(&s, table_id, 2);
+
+        let table = s.client.get_table(&table_id);
+        let current = table.current_turn;
+        let folder = table.players.get(current).unwrap();
+        s.client
+            .player_action(&table_id, &folder.address, &Action::Fold);
+
+        let accrued = s.client.get_rake_balance(&table_id);
+        assert_eq!(accrued, 15);
+        assert_eq!(s.token.balance(&s.admin), 0);
+
+        let withdrawn = s.client.withdraw_rake(&table_id);
+        assert_eq!(withdrawn, 15);
+        assert_eq!(s.token.balance(&s.admin), 15);
+        assert_eq!(s.client.get_rake_balance(&table_id), 0);
+
+        // Withdrawing again with nothing accrued is a no-op, not an error.
+        let withdrawn_again = s.client.withdraw_rake(&table_id);
+        assert_eq!(withdrawn_again, 0);
+        assert_eq!(s.token.balance(&s.admin), 15);
+    }
+
+    #[test]
+    fn test_set_rake_bps_updates_config() {
+        let s = setup();
+        let table_id = create_default_table(&s);
+
+        s.client.set_rake_bps(&table_id, &250);
+
+        let table = s.client.get_table(&table_id);
+        assert_eq!(table.config.rake_bps, 250);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #36)")]
+    fn test_set_rake_bps_rejects_above_max() {
+        let s = setup();
+        let table_id = create_default_table(&s);
+        s.client.set_rake_bps(&table_id, &501);
     }
 }

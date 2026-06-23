@@ -90,6 +90,7 @@ fn build_table(env: &Env, gen: &[GenPlayer]) -> (TableState, i128) {
             committee: admin.clone(),
             verifier: admin.clone(),
             game_hub: admin.clone(),
+            rake_bps: 0,
         },
         phase: GamePhase::Showdown,
         players,
@@ -105,6 +106,7 @@ fn build_table(env: &Env, gen: &[GenPlayer]) -> (TableState, i128) {
         last_action_ledger: 0,
         committee: admin,
         session_id: 0,
+        rake_balance: 0,
     };
     (table, total)
 }

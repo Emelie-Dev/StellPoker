@@ -112,8 +112,16 @@ fn derive_session_id(table_id: u32, hand_number: u32) -> u32 {
 #[contractimpl]
 impl PokerTableContract {
     /// Initialize a new poker table with configuration.
-    pub fn create_table(env: Env, admin: Address, config: TableConfig) -> u32 {
+    pub fn create_table(
+        env: Env,
+        admin: Address,
+        config: TableConfig,
+    ) -> Result<u32, PokerTableError> {
         admin.require_auth();
+
+        if config.rake_bps > pot::MAX_RAKE_BPS {
+            return Err(PokerTableError::RakeBpsExceedsMax);
+        }
 
         let table_id = env
             .storage()
@@ -139,6 +147,7 @@ impl PokerTableContract {
             last_action_ledger: env.ledger().sequence(),
             committee: config.committee,
             session_id: 0,
+            rake_balance: 0,
         };
 
         save_table(&env, &table);
@@ -149,7 +158,7 @@ impl PokerTableContract {
         env.events()
             .publish((Symbol::new(&env, "table_created"), table_id), admin);
 
-        table_id
+        Ok(table_id)
     }
 
     /// Join a table with a buy-in deposit.
@@ -573,5 +582,47 @@ impl PokerTableContract {
         table.admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    /// Update the rake (admin only). Capped at `MAX_RAKE_BPS` (5%).
+    pub fn set_rake_bps(env: Env, table_id: u32, rake_bps: u32) -> Result<(), PokerTableError> {
+        if rake_bps > pot::MAX_RAKE_BPS {
+            return Err(PokerTableError::RakeBpsExceedsMax);
+        }
+        let mut table = load_table(&env, table_id)?;
+        table.admin.require_auth();
+        table.config.rake_bps = rake_bps;
+        save_table(&env, &table);
+
+        env.events()
+            .publish((Symbol::new(&env, "rake_bps_updated"), table_id), rake_bps);
+        Ok(())
+    }
+
+    /// Read the rake accumulated so far for a table (view function).
+    pub fn get_rake_balance(env: Env, table_id: u32) -> Result<i128, PokerTableError> {
+        let table = load_table(&env, table_id)?;
+        Ok(table.rake_balance)
+    }
+
+    /// Withdraw the accumulated rake to the table admin. Returns the amount
+    /// withdrawn.
+    pub fn withdraw_rake(env: Env, table_id: u32) -> Result<i128, PokerTableError> {
+        let mut table = load_table(&env, table_id)?;
+        table.admin.require_auth();
+
+        let amount = table.rake_balance;
+        if amount > 0 {
+            let token = token::Client::new(&env, &table.config.token);
+            token.transfer(&env.current_contract_address(), &table.admin, &amount);
+            table.rake_balance = 0;
+            save_table(&env, &table);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "rake_withdrawn"), table_id),
+            (table.admin.clone(), amount),
+        );
+        Ok(amount)
     }
 }

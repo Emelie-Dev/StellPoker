@@ -13,6 +13,9 @@ pub struct TableConfig {
     pub committee: Address,   // MPC committee address
     pub verifier: Address,    // ZK verifier contract address
     pub game_hub: Address,    // Game hub contract for start_game/end_game
+    /// Rake taken from every pot, in basis points (100 = 1%). Capped at
+    /// `MAX_RAKE_BPS` (500 = 5%); enforced on table creation.
+    pub rake_bps: u32,
 }
 
 #[contracterror]
@@ -54,6 +57,7 @@ pub enum PokerTableError {
     TimeoutNotApplicable = 33,
     HoleCardMismatch = 34,
     WinnerNotEligibleForPot = 35,
+    RakeBpsExceedsMax = 36,
 }
 
 #[contracttype]
@@ -127,6 +131,8 @@ pub struct TableState {
     pub last_action_ledger: u32, // For timeout calculation
     pub committee: Address,
     pub session_id: u32, // Game hub session ID for current hand
+    /// Accumulated rake collected from settled hands, withdrawable by `admin`.
+    pub rake_balance: i128,
 }
 
 #[contracttype]

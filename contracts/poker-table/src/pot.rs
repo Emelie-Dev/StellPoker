@@ -2,6 +2,37 @@ use soroban_sdk::{Env, Vec};
 
 use crate::types::*;
 
+/// Maximum allowed rake, in basis points (5%). Enforced at table creation.
+pub const MAX_RAKE_BPS: u32 = 500;
+
+/// Deduct rake from each pot before distribution. Rake is computed per pot as
+/// `floor(pot.amount * rake_bps / 10_000)`, so the fee is predictable and
+/// proportional to each pot's own size — side pots are raked independently of
+/// the main pot, exactly like the main pot. Eligibility is unaffected.
+///
+/// Returns the rake-adjusted pots (same eligibility, reduced amount) and the
+/// total rake collected across all pots.
+pub fn apply_rake(
+    env: &Env,
+    pots: &Vec<SidePot>,
+    rake_bps: u32,
+) -> Result<(Vec<SidePot>, i128), PokerTableError> {
+    let mut net_pots: Vec<SidePot> = Vec::new(env);
+    let mut total_rake: i128 = 0;
+
+    for i in 0..pots.len() {
+        let pot = pots.get(i).ok_or(PokerTableError::InvalidPlayerIndex)?;
+        let rake = (pot.amount * rake_bps as i128) / 10_000;
+        total_rake += rake;
+        net_pots.push_back(SidePot {
+            amount: pot.amount - rake,
+            eligible_players: pot.eligible_players,
+        });
+    }
+
+    Ok((net_pots, total_rake))
+}
+
 /// Compute the main pot and any side pots for the current hand.
 ///
 /// Side pots are required whenever players go all-in for different total
@@ -283,6 +314,7 @@ mod pot_test {
                 committee: admin.clone(),
                 verifier: admin.clone(),
                 game_hub: admin.clone(),
+                rake_bps: 0,
             },
             phase: GamePhase::Showdown,
             players,
@@ -298,6 +330,7 @@ mod pot_test {
             last_action_ledger: 0,
             committee: admin,
             session_id: 0,
+            rake_balance: 0,
         }
     }
 
@@ -577,5 +610,132 @@ mod pot_test {
             paid += table.players.get(i).unwrap().stack;
         }
         assert_eq!(paid, total);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_rake
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rake_is_floor_division_of_pot() {
+        let env = Env::default();
+        let pots: Vec<SidePot> = Vec::from_array(
+            &env,
+            [SidePot {
+                amount: 999,
+                eligible_players: seats(&env, &[0, 1]),
+            }],
+        );
+        // 5% of 999 = 49.95 -> floor to 49.
+        let (net, rake) = apply_rake(&env, &pots, 500).unwrap();
+        assert_eq!(rake, 49);
+        assert_eq!(net.get(0).unwrap().amount, 950);
+    }
+
+    #[test]
+    fn rake_on_small_pot_can_round_to_zero() {
+        let env = Env::default();
+        let pots: Vec<SidePot> = Vec::from_array(
+            &env,
+            [SidePot {
+                amount: 3,
+                eligible_players: seats(&env, &[0, 1]),
+            }],
+        );
+        // 1% of 3 = 0.03 -> floor to 0; the whole pot is preserved.
+        let (net, rake) = apply_rake(&env, &pots, 100).unwrap();
+        assert_eq!(rake, 0);
+        assert_eq!(net.get(0).unwrap().amount, 3);
+    }
+
+    #[test]
+    fn rake_zero_bps_takes_nothing() {
+        let env = Env::default();
+        let pots: Vec<SidePot> = Vec::from_array(
+            &env,
+            [SidePot {
+                amount: 10_000,
+                eligible_players: seats(&env, &[0, 1]),
+            }],
+        );
+        let (net, rake) = apply_rake(&env, &pots, 0).unwrap();
+        assert_eq!(rake, 0);
+        assert_eq!(net.get(0).unwrap().amount, 10_000);
+    }
+
+    #[test]
+    fn rake_is_deducted_independently_per_side_pot() {
+        // Multi-way all-in: main pot 150, side pot 100. Rake (5%) is taken
+        // from each pot separately, not from the combined total.
+        let env = Env::default();
+        let pots: Vec<SidePot> = Vec::from_array(
+            &env,
+            [
+                SidePot {
+                    amount: 150,
+                    eligible_players: seats(&env, &[0, 1, 2]),
+                },
+                SidePot {
+                    amount: 100,
+                    eligible_players: seats(&env, &[1, 2]),
+                },
+            ],
+        );
+        let (net, rake) = apply_rake(&env, &pots, 500).unwrap();
+        // floor(150*0.05) = 7, floor(100*0.05) = 5 -> total 12.
+        assert_eq!(rake, 12);
+        assert_eq!(net.get(0).unwrap().amount, 143);
+        assert_eq!(net.get(1).unwrap().amount, 95);
+        // Eligibility is preserved.
+        assert_eq!(
+            net.get(0).unwrap().eligible_players,
+            seats(&env, &[0, 1, 2])
+        );
+        assert_eq!(net.get(1).unwrap().eligible_players, seats(&env, &[1, 2]));
+    }
+
+    #[test]
+    fn rake_capped_at_max_does_not_overflow_pot() {
+        let env = Env::default();
+        let pots: Vec<SidePot> = Vec::from_array(
+            &env,
+            [SidePot {
+                amount: 1,
+                eligible_players: seats(&env, &[0, 1]),
+            }],
+        );
+        // Even at the max cap (500 bps), a 1-chip pot rounds the rake to 0,
+        // and the pot is never driven negative.
+        let (net, rake) = apply_rake(&env, &pots, MAX_RAKE_BPS).unwrap();
+        assert_eq!(rake, 0);
+        assert_eq!(net.get(0).unwrap().amount, 1);
+    }
+
+    #[test]
+    fn rake_conserves_chips_with_distribution() {
+        // Full flow: all-in pots -> rake -> distribute. Total chips paid out
+        // plus rake collected must equal the original pot total.
+        let env = Env::default();
+        let players = Vec::from_array(
+            &env,
+            [
+                player(&env, 0, 50, true, false),
+                player(&env, 1, 100, true, false),
+                player(&env, 2, 100, false, false),
+            ],
+        );
+        let mut table = table_with(&env, players);
+        let pots = calculate_side_pots(&env, &table).unwrap();
+        let gross_total = sum_pots(&pots);
+
+        let (net_pots, rake) = apply_rake(&env, &pots, 200).unwrap(); // 2%
+        let ranking = seats(&env, &[2, 1, 0]);
+        let payouts = distribute_pots(&env, &mut table, &net_pots, &ranking).unwrap();
+
+        let mut paid = 0i128;
+        for i in 0..payouts.len() {
+            paid += payouts.get(i).unwrap().1;
+        }
+        assert_eq!(paid + rake, gross_total);
     }
 }
