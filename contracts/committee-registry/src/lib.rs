@@ -74,6 +74,7 @@ pub enum RegistryKey {
     SlashEvent(u32), // slash event counter
     TimeoutConfig,
     Game(u32),
+    Paused,
 }
 
 #[contractimpl]
@@ -550,6 +551,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         token::{StellarAssetClient, TokenClient},
+        String,
     };
 
     struct Setup<'a> {
@@ -578,7 +580,7 @@ mod test {
         client.register_member(
             &member,
             &1_000,
-            &soroban_sdk::String::from_str(&env, "node-0"),
+            &String::from_str(&env, "node-0"),
         );
 
         Setup {
@@ -588,6 +590,22 @@ mod test {
             admin,
             member,
         }
+    }
+
+    fn setup_paused() -> (
+        Env,
+        CommitteeRegistryContractClient<'static>,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CommitteeRegistryContract, ());
+        let client = CommitteeRegistryContractClient::new(&env, &contract_id);
+        let token_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &sac.address(), &100);
+        (env, client, admin)
     }
 
     #[test]
@@ -645,47 +663,10 @@ mod test {
 
         s.client.report_timeout(&7, &s.member);
     }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::{StellarAssetClient, TokenClient},
-        Address, Env, String, Vec,
-    };
-
-    fn setup() -> (
-        Env,
-        CommitteeRegistryContractClient<'static>,
-        Address,
-        TokenClient<'static>,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(CommitteeRegistryContract, ());
-        let client = CommitteeRegistryContractClient::new(&env, &contract_id);
-
-        let token_admin = Address::generate(&env);
-        let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
-        let token = TokenClient::new(&env, &sac.address());
-        let token_sac = StellarAssetClient::new(&env, &sac.address());
-
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &sac.address(), &100);
-
-        // Mint tokens for a member
-        let member = Address::generate(&env);
-        token_sac.mint(&member, &1000);
-        let _ = member; // avoid unused warning; caller mints their own
-
-        (env, client, admin, token)
-    }
 
     #[test]
     fn test_pause_and_unpause() {
-        let (_env, client, admin, _token) = setup();
+        let (_env, client, admin) = setup_paused();
         assert!(!client.is_paused());
         client.pause(&admin);
         assert!(client.is_paused());
@@ -696,7 +677,7 @@ mod test {
     #[test]
     #[should_panic(expected = "contract paused")]
     fn test_paused_blocks_register_member() {
-        let (env, client, admin, _token) = setup();
+        let (env, client, admin) = setup_paused();
         client.pause(&admin);
 
         let member = Address::generate(&env);
@@ -707,7 +688,7 @@ mod test {
     #[test]
     #[should_panic(expected = "contract paused")]
     fn test_paused_blocks_create_epoch() {
-        let (env, client, admin, _token) = setup();
+        let (env, client, admin) = setup_paused();
         client.pause(&admin);
 
         let members: Vec<Address> = Vec::new(&env);
@@ -716,7 +697,7 @@ mod test {
 
     #[test]
     fn test_admin_can_read_while_paused() {
-        let (_env, client, admin, _token) = setup();
+        let (_env, client, admin) = setup_paused();
         client.pause(&admin);
         // get_current_epoch is a read and must not panic
         let epoch = client.get_current_epoch();
@@ -725,9 +706,8 @@ mod test {
 
     #[test]
     fn test_unpause_allows_operations_again() {
-        let (env, client, admin, _token) = setup();
-
-        // Mint enough tokens for the member
+        let env = Env::default();
+        env.mock_all_auths();
         let token_admin = Address::generate(&env);
         let sac2 = env.register_stellar_asset_contract_v2(token_admin.clone());
         let token_sac2 = StellarAssetClient::new(&env, &sac2.address());
@@ -751,7 +731,7 @@ mod test {
     #[test]
     #[should_panic(expected = "not admin")]
     fn test_non_admin_cannot_pause() {
-        let (env, client, _admin, _token) = setup();
+        let (env, client, _admin) = setup_paused();
         let stranger = Address::generate(&env);
         client.pause(&stranger);
     }
