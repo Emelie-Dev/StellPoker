@@ -268,7 +268,7 @@ impl CommitteeRegistryContract {
             .get(&RegistryKey::StakeToken)
             .unwrap();
         let token = token::Client::new(&env, &token_addr);
-        token.transfer(&member, env.current_contract_address(), &stake);
+        token.transfer(&member, &env.current_contract_address(), &stake);
 
         let member_state = CommitteeMember {
             address: member.clone(),

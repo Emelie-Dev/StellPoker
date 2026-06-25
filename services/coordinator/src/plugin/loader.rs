@@ -337,10 +337,10 @@ mod tests {
         Engine::new(&config).unwrap()
     }
 
-    #[test]
-    fn test_plugin_loader_creation() {
+    #[tokio::test]
+    async fn test_plugin_loader_creation() {
         let engine = test_engine();
         let loader = PluginLoader::new(engine);
-        assert!(loader.plugins().read().unwrap().is_empty());
+        assert!(loader.plugins().read().await.is_empty());
     }
 }
