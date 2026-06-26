@@ -46,6 +46,7 @@ mod discovery;
 mod feature_flags;
 mod hot_reload;
 mod mpc;
+mod mpc_auth_middleware;
 mod plugin;
 mod rate_limit_db;
 #[path = "middleware.rs"]
@@ -651,6 +652,10 @@ async fn main() {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mpc_auth_middleware::authenticate_mpc_request,
         ))
         .layer(middleware::from_fn(request_log::log_request))
         .layer(build_cors_layer(state.db_pool.as_deref()).await)
