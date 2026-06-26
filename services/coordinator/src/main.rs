@@ -21,14 +21,14 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use prometheus::{
     Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,10 +38,13 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 mod api;
+mod archiver;
 mod audit_log;
 mod cors_db;
 mod db;
+mod discovery;
 mod feature_flags;
+mod hot_reload;
 mod mpc;
 mod plugin;
 mod rate_limit_db;
@@ -126,6 +129,8 @@ struct AppState {
     db_pool: Option<Arc<sqlx::PgPool>>,
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
+    pub archive_store: archiver::ArchiveStore,
+    pub archive_config: archiver::ArchiveConfig,
 }
 
 #[derive(Clone)]
@@ -133,6 +138,10 @@ struct AppState {
 struct MpcConfig {
     /// Endpoints of the 3 MPC nodes
     node_endpoints: Vec<String>,
+    /// Whether `node_endpoints` came from explicitly-set `MPC_NODE_*` env vars
+    /// (vs. built-in localhost defaults). When true, dynamic node discovery is
+    /// disabled and these static endpoints are used (backward compatibility).
+    static_endpoints_configured: bool,
     /// Path to compiled Noir circuits (ACIR)
     circuit_dir: String,
     /// Soroban RPC endpoint
@@ -141,7 +150,7 @@ struct MpcConfig {
     committee_secret: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct TableSession {
     table_id: u32,
@@ -201,12 +210,17 @@ async fn main() {
         tracing_subscriber::fmt().init();
     }
 
+    // If any MPC_NODE_* env var is explicitly set, treat the endpoints as
+    // statically configured and disable dynamic discovery (backward compat).
+    let static_endpoints_configured = (0..3)
+        .any(|i| std::env::var(format!("MPC_NODE_{}", i)).is_ok());
     let mpc_config = MpcConfig {
         node_endpoints: vec![
             std::env::var("MPC_NODE_0").unwrap_or_else(|_| "http://localhost:8101".to_string()),
             std::env::var("MPC_NODE_1").unwrap_or_else(|_| "http://localhost:8102".to_string()),
             std::env::var("MPC_NODE_2").unwrap_or_else(|_| "http://localhost:8103".to_string()),
         ],
+        static_endpoints_configured,
         circuit_dir: std::env::var("CIRCUIT_DIR").unwrap_or_else(|_| "./circuits".to_string()),
         soroban_rpc: std::env::var("SOROBAN_RPC")
             .unwrap_or_else(|_| "http://localhost:8000/soroban/rpc".to_string()),
@@ -389,8 +403,8 @@ async fn main() {
         .consume_fuel(true)
         .wasm_multi_value(true)
         .wasm_memory64(false);
-    let plugin_engine = wasmtime::Engine::new(&wasm_config)
-        .expect("failed to create wasmtime engine");
+    let plugin_engine =
+        wasmtime::Engine::new(&wasm_config).expect("failed to create wasmtime engine");
     let plugin_loader = plugin::PluginLoader::new(plugin_engine);
     let plugin_loader = Arc::new(tokio::sync::RwLock::new(plugin_loader));
     {
@@ -403,9 +417,36 @@ async fn main() {
         }
     }
 
+    let hot_reload_snapshot = hot_reload::snapshot_path_from_env();
+    let restored_snapshot = hot_reload_snapshot
+        .as_ref()
+        .and_then(|path| hot_reload::load_snapshot(path));
+    let tables = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tables.clone())
+            .unwrap_or_default(),
+    ));
+    let lobby_assignments = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lobby_assignments.clone())
+            .unwrap_or_default(),
+    ));
+    if let Some(snapshot) = &restored_snapshot {
+        tracing::info!(
+            "Restored hot-reload snapshot with {} table session(s)",
+            snapshot.tables.len()
+        );
+    }
+
+    let archive_config = archiver::ArchiveConfig::from_env();
+    let archive_store = archiver::new_store();
+    archiver::load_existing_archives(&archive_store, &archive_config).await;
+
     let state = AppState {
-        tables: Arc::new(RwLock::new(HashMap::new())),
-        lobby_assignments: Arc::new(RwLock::new(HashMap::new())),
+        tables: Arc::clone(&tables),
+        lobby_assignments: Arc::clone(&lobby_assignments),
         mpc_config,
         soroban_config,
         auth_state: Arc::new(RwLock::new(AuthState::default())),
@@ -420,7 +461,20 @@ async fn main() {
         db_pool,
         instance_id,
         plugin_loader,
+        archive_store: archive_store.clone(),
+        archive_config: archive_config.clone(),
     };
+
+    if let Some(path) = hot_reload_snapshot {
+        hot_reload::spawn_snapshot_task(path, tables, lobby_assignments);
+    }
+
+    archiver::spawn_archive_task(
+        state.mpc_sessions.clone(),
+        Arc::clone(&state.tables),
+        archive_store.clone(),
+        archive_config,
+    );
 
     // Spawn background node health check task
     let node_healths = state.metrics.node_healths.clone();
@@ -434,7 +488,10 @@ async fn main() {
                 match soroban::fetch_active_nodes_from_registry(&soroban_config).await {
                     Ok(members) => members.into_iter().map(|m| m.endpoint).collect(),
                     Err(e) => {
-                        tracing::warn!("Failed to fetch nodes from registry for health check: {}", e);
+                        tracing::warn!(
+                            "Failed to fetch nodes from registry for health check: {}",
+                            e
+                        );
                         default_endpoints.clone()
                     }
                 }
@@ -464,7 +521,11 @@ async fn main() {
                     guard.push(MpcNodeHealth {
                         endpoint,
                         connected: is_healthy,
-                        last_heartbeat: if is_healthy { Some(SystemTime::now()) } else { None },
+                        last_heartbeat: if is_healthy {
+                            Some(SystemTime::now())
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -476,6 +537,11 @@ async fn main() {
         .route("/metrics", get(metrics_endpoint))
         .route("/api/health", get(health))
         .route("/api/stats", get(get_stats))
+        // Dynamic MPC node discovery (active only when neither the committee
+        // registry nor static MPC_NODE_* endpoints are configured).
+        .route("/api/node/register", post(api::register_node))
+        .route("/api/node/:id/heartbeat", post(api::node_heartbeat))
+        .route("/api/node/:id", delete(api::deregister_node))
         .route("/api/flags", get(api::flags::list_flags))
         .route("/api/flags/:key", post(api::flags::set_flag))
         // Plugin management endpoints
@@ -483,10 +549,7 @@ async fn main() {
         .route("/api/plugins/health", get(api::plugins::plugin_health))
         .route("/api/plugins/load", post(api::plugins::load_plugin))
         .route("/api/plugins/rescan", post(api::plugins::rescan_plugins))
-        .route(
-            "/api/plugins/:name",
-            get(api::plugins::get_plugin),
-        )
+        .route("/api/plugins/:name", get(api::plugins::get_plugin))
         .route(
             "/api/plugins/:name/unload",
             post(api::plugins::unload_plugin),
@@ -571,6 +634,19 @@ async fn main() {
         .route(
             "/api/admin/migrations/:id/cancel",
             post(api::admin_cancel_migration),
+        )
+        // Session archiving endpoints (Issue #259)
+        .route(
+            "/api/admin/archives",
+            get(api::admin_list_archives),
+        )
+        .route(
+            "/api/admin/archives/:archive_id",
+            get(api::admin_get_archive),
+        )
+        .route(
+            "/api/admin/archives/purge",
+            post(api::admin_purge_archives),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
