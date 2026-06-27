@@ -8,12 +8,16 @@ mod constant_time;
 mod game;
 mod game_hub;
 #[cfg(test)]
+mod gas_regression_test;
+#[cfg(test)]
 mod invariants_test;
 #[cfg(test)]
 mod lifecycle_invariants_test;
 mod pot;
 mod test;
 mod timeout;
+#[cfg(test)]
+mod tournament_lifecycle_test;
 mod types;
 mod verifier;
 

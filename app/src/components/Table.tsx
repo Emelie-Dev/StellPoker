@@ -19,6 +19,7 @@ import {
 } from "@/lib/wallet";
 import { GameBoyButton, GameBoyModal } from "./GameBoyModal";
 import { HandHistoryPanel } from "./HandHistoryPanel";
+import { TransactionSimulation } from "./TransactionSimulation";
 import { usePokerActions } from "@/lib/use-poker-actions";
 import { getDealerLine } from "@/lib/dealer-lines";
 import { subscribePokerTableEvents } from "@/lib/events";
@@ -274,6 +275,9 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     handleReveal,
     handleShowdown,
     handleAction,
+    joinSimulation,
+    actionSimulation,
+    pendingAction,
   } = usePokerActions({
     tableId,
     wallet,
@@ -1280,6 +1284,37 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Transaction Simulations */}
+      {joinSimulation.showSimulation && joinSimulation.simulation && (
+        <TransactionSimulation
+          simulation={joinSimulation.simulation}
+          loading={joinSimulation.loading}
+          onConfirm={() => {
+            joinSimulation.confirmJoin();
+          }}
+          onCancel={() => {
+            joinSimulation.cancelSimulation();
+          }}
+        />
+      )}
+
+      {actionSimulation.showSimulation && actionSimulation.simulation && pendingAction && (
+        <TransactionSimulation
+          simulation={actionSimulation.simulation}
+          loading={actionSimulation.loading}
+          onConfirm={() => {
+            actionSimulation.confirmAction(
+              tableId, 
+              pendingAction.action, 
+              pendingAction.amount
+            );
+          }}
+          onCancel={() => {
+            actionSimulation.cancelSimulation();
+          }}
+        />
       )}
     </PixelWorld>
   );
