@@ -1292,16 +1292,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
           simulation={joinSimulation.simulation}
           loading={joinSimulation.loading}
           onConfirm={() => {
-            // The join table simulation will be handled by the hook
-            // but we need to provide the table ID and buy-in parameters
-            const tableState = game.tableState?.parsed;
-            if (tableState && typeof tableState === "object" && "config" in tableState) {
-              const config = tableState.config as { min_buy_in?: unknown };
-              const buyIn = typeof config.min_buy_in === "bigint" 
-                ? config.min_buy_in 
-                : BigInt("1000000000");
-              joinSimulation.confirmJoin(tableId, buyIn);
-            }
+            joinSimulation.confirmJoin();
           }}
           onCancel={() => {
             joinSimulation.cancelSimulation();
